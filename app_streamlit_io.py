@@ -16,6 +16,7 @@ import requests
 import base64
 from PIL import Image
 import io
+import kagglehub
 # Thêm import cho Jiayan NLP với error handling
 try:
     from jiayan import load_lm, CRFSentencizer, CharHMMTokenizer
@@ -132,9 +133,13 @@ def load_jiayan_models():
         return None, None
     
     try:
-        # Đường dẫn đến model files - điều chỉnh cho Streamlit Cloud
-        lm_path = os.path.join("jiayan_models", "jiayan.klm")
-        cut_model_path = os.path.join("jiayan_models", "cut_model")
+        # Download Jiayan models from Kaggle
+        with st.spinner("📥 Đang tải Jiayan models từ Kaggle..."):
+            path = kagglehub.model_download("phuchoangnguyen/jalian-models-split-chinese-sentences/pyTorch/default")
+        
+        # Đường dẫn đến model files từ Kaggle
+        lm_path = os.path.join(path, "jiayan.klm")
+        cut_model_path = os.path.join(path, "cut_model")
         
         # Kiểm tra file có tồn tại không
         if not os.path.exists(lm_path):
@@ -153,6 +158,7 @@ def load_jiayan_models():
         
         tokenizer = CharHMMTokenizer(lm) if lm else None
         
+        st.success("✅ Đã tải Jiayan models từ Kaggle thành công!")
         return sentencizer, tokenizer
     except Exception as e:
         st.warning(f"⚠️ Lỗi khi tải Jiayan models: {e}. Sử dụng xử lý cơ bản.")
