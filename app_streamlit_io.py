@@ -18,9 +18,10 @@ from PIL import Image
 import io
 import kagglehub
 # Thêm import cho Jiayan NLP với error handling
+# Disabled due to kenlm compatibility issues with Python 3.13
 try:
-    from jiayan import load_lm, CRFSentencizer, CharHMMTokenizer
-    JIAYAN_AVAILABLE = True
+    # from jiayan import load_lm, CRFSentencizer, CharHMMTokenizer
+    JIAYAN_AVAILABLE = False  # Force disable
 except ImportError:
     JIAYAN_AVAILABLE = False
     CRFSentencizer = None
@@ -127,42 +128,9 @@ def filter_han_nom_text(text):
 
 @st.cache_resource
 def load_jiayan_models():
-    """Load Jiayan models for text processing with fallback"""
-    if not JIAYAN_AVAILABLE:
-        st.warning("⚠️ Jiayan library không có sẵn. Sử dụng xử lý cơ bản.")
-        return None, None
-    
-    try:
-        # Download Jiayan models from Kaggle
-        with st.spinner("📥 Đang tải Jiayan models từ Kaggle..."):
-            path = kagglehub.model_download("phuchoangnguyen/jalian-models-split-chinese-sentences/pyTorch/default")
-        
-        # Đường dẫn đến model files từ Kaggle
-        lm_path = os.path.join(path, "jiayan.klm")
-        cut_model_path = os.path.join(path, "cut_model")
-        
-        # Kiểm tra file có tồn tại không
-        if not os.path.exists(lm_path):
-            st.info(f"💡 Không tìm thấy Jiayan models tại {lm_path}. Sử dụng xử lý cơ bản.")
-            return None, None
-            
-        # Tải language model
-        lm = load_lm(lm_path)
-        sentencizer = CRFSentencizer(lm)
-        
-        # Load CRF model cho sentence segmentation
-        if os.path.exists(cut_model_path):
-            sentencizer.load(cut_model_path)
-        else:
-            st.info(f"💡 Không tìm thấy cut_model. Sentencizer hoạt động ở chế độ cơ bản.")
-        
-        tokenizer = CharHMMTokenizer(lm) if lm else None
-        
-        st.success("✅ Đã tải Jiayan models từ Kaggle thành công!")
-        return sentencizer, tokenizer
-    except Exception as e:
-        st.warning(f"⚠️ Lỗi khi tải Jiayan models: {e}. Sử dụng xử lý cơ bản.")
-        return None, None
+    """Load Jiayan models - disabled due to kenlm compatibility issues"""
+    st.info("💡 Jiayan processing disabled due to Python 3.13 compatibility. Using basic text processing.")
+    return None, None
 
 def preprocess_han_nom_text(text):
     """Tiền xử lý văn bản Hán-Nôm: tách câu và lọc ký tự"""
