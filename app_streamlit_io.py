@@ -318,7 +318,7 @@ def call_ocr_api(base64_image):
         }
         
         ocr_url = get_ocr_api_url()
-        response = requests.post(ocr_url, json=payload, headers=headers, verify=False, timeout=30)
+        response = requests.post(ocr_url, json=payload, headers=headers, verify=False, timeout=120)
         return response
         
     except requests.exceptions.Timeout:
