@@ -129,36 +129,17 @@ def filter_han_nom_text(text):
 @st.cache_resource
 def load_jiayan_models():
     """Load Jiayan models - disabled due to kenlm compatibility issues"""
-    st.info("💡 Jiayan processing disabled due to Python 3.13 compatibility. Using basic text processing.")
     return None, None
 
 def preprocess_han_nom_text(text):
-    """Tiền xử lý văn bản Hán-Nôm: tách câu và lọc ký tự"""
+    """Tiền xử lý văn bản Hán-Nôm: chỉ lọc ký tự Hán-Nôm"""
     # Lọc chỉ giữ ký tự Hán-Nôm
     filtered_text = filter_han_nom_text(text)
     
     if not filtered_text.strip():
-        return []
+        return ""
     
-    # Tải Jiayan models nếu có
-    sentencizer, tokenizer = load_jiayan_models()
-    
-    sentences = []
-    if sentencizer:
-        try:
-            # Sử dụng Jiayan để tách câu
-            sentences = sentencizer.sentencize(filtered_text)
-        except Exception as e:
-            st.warning(f"Lỗi khi sử dụng Jiayan sentencizer: {e}")
-            sentences = []
-    
-    # Fallback: dùng regex đơn giản
-    if not sentences:
-        # Tách theo dấu câu truyền thống
-        sentences = re.split(r'[,。，；：""（）《》]', filtered_text)
-        sentences = [s.strip() for s in sentences if s.strip()]
-    
-    return sentences
+    return filtered_text
 
 # Model Definition
 class BertLSTMClassifier(nn.Module):
@@ -350,6 +331,7 @@ def run_ocr_on_image(image_bytes):
         return '', None
     
     raw_text = ""
+    ocr_text_list = []
     
     # Xử lý kết quả từ API
     if api_result.status_code == 200:
@@ -365,25 +347,23 @@ def run_ocr_on_image(image_bytes):
         return '', None
     
     if raw_text:
-        # Hiển thị văn bản đã nhận diện
+        # Hiển thị văn bản đã nhận diện từng câu xuống dòng
         st.markdown("**Văn bản đã nhận diện:**")
-        st.text_area("Văn bản gốc", value=raw_text, height=120, disabled=True, label_visibility="hidden")
+        # Hiển thị từng câu trên một dòng riêng
+        if ocr_text_list:
+            ocr_display = "\\n".join(ocr_text_list)
+        else:
+            ocr_display = raw_text
+        st.text_area("Văn bản gốc", value=ocr_display, height=120, disabled=True, label_visibility="hidden")
 
-        # Tiền xử lý văn bản Hán-Nôm
+        # Tiền xử lý văn bản Hán-Nôm (chỉ lọc ký tự)
         if raw_text.strip():
-            processed_sentences = preprocess_han_nom_text(raw_text)
+            processed_text = preprocess_han_nom_text(raw_text)
             
-            if processed_sentences:
-                # Hiển thị các câu sau khi xử lý
-                st.markdown("**Văn bản sau khi xử lý:**")
-                processed_text_display = '\\n'.join(processed_sentences)
-                st.text_area("Văn bản đã xử lý", value=processed_text_display, height=100, disabled=True, label_visibility="hidden")
-                
-                # Ghép lại thành văn bản hoàn chỉnh để phân loại
-                processed_text = ' '.join(processed_sentences)
+            if processed_text:
                 return processed_text, api_result
             else:
-                st.info("💡 Sử dụng văn bản gốc do không tách được câu Hán-Nôm.")
+                st.info("💡 Sử dụng văn bản gốc do không có ký tự Hán-Nôm.")
                 return raw_text, api_result
     else:
         st.warning("⚠️ Không phát hiện văn bản trong ảnh.")
