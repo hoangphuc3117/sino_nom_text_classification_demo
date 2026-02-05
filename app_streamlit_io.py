@@ -338,7 +338,7 @@ def run_ocr_on_image(image_bytes):
         try:
             ocr_response_json = api_result.json()
             ocr_text_list = ocr_response_json.get("ocrResult", [])
-            raw_text = "\\n".join(ocr_text_list) if ocr_text_list else ""
+            raw_text = "\n".join(ocr_text_list) if ocr_text_list else ""
         except Exception as e:
             st.error(f"❌ Lỗi khi parse JSON response: {e}")
             return '', None
@@ -351,10 +351,10 @@ def run_ocr_on_image(image_bytes):
         st.markdown("**Văn bản đã nhận diện:**")
         # Hiển thị từng câu trên một dòng riêng
         if ocr_text_list:
-            ocr_display = "\\n".join(ocr_text_list)
+            ocr_display = "\n".join(ocr_text_list)
         else:
             ocr_display = raw_text
-        st.text_area("Văn bản gốc", value=ocr_display, height=120, disabled=True, label_visibility="hidden")
+        st.text_area("Văn bản gốc", value=ocr_display, height=300, disabled=False, label_visibility="hidden")
 
         # Tiền xử lý văn bản Hán-Nôm (chỉ lọc ký tự)
         if raw_text.strip():
