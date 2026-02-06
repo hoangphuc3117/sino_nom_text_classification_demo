@@ -1,6 +1,7 @@
 {
-  "num_classes": 6,
+  "num_classes": 7,
   "class_names": [
+    "Admin",
     "Medical",
     "History",
     "Literature",
@@ -9,11 +10,12 @@
     "Others"
   ],
   "label_mapping": {
-    "Medical": 0,
-    "History": 1,
-    "Literature": 2,
-    "Buddhism": 3,
-    "Catholics": 4,
-    "Others": 5
+    "Admin": 0,
+    "Medical": 1,
+    "History": 2,
+    "Literature": 3,
+    "Buddhism": 4,
+    "Catholics": 5,
+    "Others": 6
   }
 }

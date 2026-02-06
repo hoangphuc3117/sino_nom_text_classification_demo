@@ -1,6 +1,6 @@
 """
 Streamlit Demo for Sino-Nom Text Classification
-Using BERT-LSTM Model with 6 Classes
+Using BERT-LSTM Model with 7 Classes
 Optimized for Streamlit Cloud deployment
 """
 import streamlit as st
@@ -143,7 +143,7 @@ def preprocess_han_nom_text(text):
 
 # Model Definition
 class BertLSTMClassifier(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=256, num_layers=3, dropout=0.5, num_classes=6):
+    def __init__(self, input_dim=768, hidden_dim=256, num_layers=3, dropout=0.5, num_classes=7):
         super().__init__()
         self.lstm = nn.LSTM(
             input_dim, hidden_dim, num_layers,
@@ -227,12 +227,12 @@ def extract_bert_features(text, tokenizer, bert_model, device, max_len=128):
     
     return features
 
-def make_prob_table(logits, num_classes=6):
+def make_prob_table(logits, num_classes=7):
     """Convert logits to probability table using softmax"""
     probs = torch.softmax(torch.FloatTensor(logits), dim=-1).numpy()
     return probs
 
-def predict_with_templates(prob_table, templates, num_classes=6):
+def predict_with_templates(prob_table, templates, num_classes=7):
     """Classify using nearest template (Euclidean distance)"""
     distances = np.zeros((prob_table.shape[0], num_classes))
     
@@ -378,7 +378,7 @@ def main():
     st.markdown("""
     <div class="streamlit-info">
         <strong>🚀 Deployed on Streamlit Cloud</strong><br>
-        Ứng dụng này sử dụng BERT-LSTM để phân loại văn bản Hán-Nôm thành 6 loại: Y học, Lịch sử, Văn học, Phật giáo, Công giáo, và Khác.
+        Ứng dụng này sử dụng BERT-LSTM để phân loại văn bản Hán-Nôm thành 7 loại: Hành chính, Y học, Lịch sử, Văn học, Phật giáo, Công giáo, và Khác.
     </div>
     """, unsafe_allow_html=True)
     
@@ -398,8 +398,9 @@ def main():
     
     # Display class labels
     st.markdown("**Các loại văn bản (Categories):**")
-    cols = st.columns(6)
+    cols = st.columns(7)
     category_icons = {
+        "Admin": "🏛️",
         "Medical": "🏥",
         "History": "📚", 
         "Literature": "📖",
@@ -542,7 +543,7 @@ def main():
         """
         <div style="text-align: center; color: gray;">
             <p>📜 <strong>Sino-Nom Text Classification</strong> | BERT-LSTM Model</p>
-            <p>6 Classes: Medical, History, Literature, Buddhism, Catholics, Others</p>
+            <p>7 Classes: Admin, Medical, History, Literature, Buddhism, Catholics, Others</p>
             <p><em>🚀 Powered by Streamlit Cloud</em></p>
         </div>
         """,
