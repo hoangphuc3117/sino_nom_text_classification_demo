@@ -492,7 +492,7 @@ def main():
         st.markdown("**Nhập văn bản Hán-Nôm để phân loại:**")
         text_input = st.text_area(
             "Văn bản Hán-Nôm:",
-            height=200,
+            height=300,
             placeholder="Nhập văn bản Hán-Nôm vào đây...\\n(Ví dụ: 運衰死沙場宣立萬春國)",
             help="Nhập văn bản cần phân loại. Văn bản có thể bằng chữ Hán, chữ Nôm, hoặc hỗn hợp."
         )
