@@ -209,63 +209,76 @@ def load_models():
         return None
 
 def extract_bert_features(text, tokenizer, bert_model, device, max_len=128):
-    """Extract BERT features from text"""
-    encoded = tokenizer(
-        text, 
-        padding='max_length', 
-        truncation=True, 
-        max_length=max_len, 
-        return_tensors='pt'
-    )
-    
-    input_ids = encoded['input_ids'].to(device)
-    attention_mask = encoded['attention_mask'].to(device)
-    
+    """Extract BERT features from text - optimized version"""
     with torch.no_grad():
+        encoded = tokenizer(
+            text, 
+            padding='max_length', 
+            truncation=True, 
+            max_length=max_len, 
+            return_tensors='pt'
+        )
+        
+        input_ids = encoded['input_ids'].to(device)
+        attention_mask = encoded['attention_mask'].to(device)
+        
         outputs = bert_model(input_ids, attention_mask=attention_mask)
-        features = outputs.last_hidden_state.cpu().numpy()
+        # Giữ tensor trên device để tránh chuyển đổi không cần thiết
+        features = outputs.last_hidden_state
     
     return features
 
 def make_prob_table(logits, num_classes=7):
-    """Convert logits to probability table using softmax"""
-    probs = torch.softmax(torch.FloatTensor(logits), dim=-1).numpy()
+    """Convert logits to probability table using softmax - optimized version"""
+    # Tránh chuyển đổi không cần thiết nếu logits đã là tensor
+    if isinstance(logits, torch.Tensor):
+        probs = torch.softmax(logits, dim=-1)
+    else:
+        probs = torch.softmax(torch.FloatTensor(logits), dim=-1)
     return probs
 
 def predict_with_templates(prob_table, templates, num_classes=7):
-    """Classify using nearest template (Euclidean distance)"""
-    distances = np.zeros((prob_table.shape[0], num_classes))
+    """Classify using nearest template (Euclidean distance) - optimized version"""
+    # Chuyển prob_table sang numpy nếu là tensor
+    if isinstance(prob_table, torch.Tensor):
+        prob_table_np = prob_table.cpu().numpy()
+    else:
+        prob_table_np = prob_table
     
+    batch_size = prob_table_np.shape[0]
+    distances = np.full((batch_size, num_classes), np.inf)
+    
+    # Vectorized computation cho tất cả templates cùng lúc
     for class_id in range(num_classes):
         if class_id in templates:
-            dist = np.sqrt(np.sum((prob_table - templates[class_id]) ** 2, axis=(1, 2)))
-            distances[:, class_id] = dist
-        else:
-            distances[:, class_id] = np.inf  # Nếu không có template
+            # Tính squared difference một lần, sau đó sum và sqrt
+            diff = prob_table_np - templates[class_id]
+            distances[:, class_id] = np.linalg.norm(diff.reshape(batch_size, -1), axis=1)
     
-    return np.argmin(distances, axis=1), distances
+    pred_idx = np.argmin(distances, axis=1)
+    return pred_idx, distances
 
 def classify_text(text, tokenizer, bert_model, lstm_model, templates, class_names, num_classes, device):
-    """Classify a single text"""
-    # Extract BERT features
-    features = extract_bert_features(text, tokenizer, bert_model, device)
-    
-    # Get LSTM logits
+    """Classify a single text - optimized version"""
     with torch.no_grad():
-        logits = lstm_model(torch.FloatTensor(features).to(device)).cpu().numpy()
+        # Extract BERT features (đã ở dạng tensor trên device)
+        features = extract_bert_features(text, tokenizer, bert_model, device)
+        
+        # Get LSTM logits (giữ trên device)
+        logits = lstm_model(features)
+        
+        # Get probability table (giữ dạng tensor)
+        prob_table = make_prob_table(logits, num_classes)
     
-    # Get probability table
-    prob_table = make_prob_table(logits, num_classes)
-    
-    # Predict with templates
+    # Predict with templates (chuyển sang numpy chỉ khi cần)
     pred_idx, distances = predict_with_templates(prob_table, templates, num_classes)
     
     # Calculate confidence (inverse of distance, normalized)
     all_dists = distances[0]
     
-    # Convert distances to similarity scores (inverse)
-    similarities = 1 / (1 + all_dists)
-    confidence = similarities / similarities.sum()
+    # Convert distances to similarity scores (inverse) - sử dụng numpy operations hiệu quả hơn
+    similarities = 1.0 / (1.0 + all_dists)
+    confidence = similarities / np.sum(similarities)
     
     return class_names[pred_idx[0]], confidence, pred_idx[0]
 
