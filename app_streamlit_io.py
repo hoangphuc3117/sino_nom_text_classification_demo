@@ -96,9 +96,9 @@ _MODEL_DIR_CANDIDATES = [
     os.path.join(_APP_DIR, "..", "yhct_classification_model2", "models_student_6l"),
 ]
 
-# Kaggle dataset chua thu muc models_student_6l (model_fp16.pt, tokenizer/, meta.json).
-# Sua handle nay theo dataset cua ban, hoac ghi de bang secrets/env KAGGLE_DATASET.
-_DEFAULT_KAGGLE_DATASET = "phuchoangnguyen/sinonomtext-bert-fp16/pyTorch/default"
+# Kaggle model chua thu muc models_student_6l (model_fp16.pt, tokenizer/, meta.json).
+# Sua handle nay theo model cua ban, hoac ghi de bang secrets/env KAGGLE_MODEL.
+_DEFAULT_KAGGLE_MODEL = "phuchoangnguyen/sinonomtext-bert-fp16/pyTorch/default"
 
 CATEGORY_ICONS = {
     "Admin": "🏛️",
@@ -145,18 +145,38 @@ def _get_secret(key, default=""):
     return os.environ.get(key, default)
 
 
+def _normalize_kaggle_model_handle(resource):
+    """Chuan hoa handle Kaggle, giu nguyen duong dan model/ dataset con."""
+    resource = (resource or "").strip().strip('"').strip("'")
+    if not resource:
+        return ""
+
+    if "kaggle.com/models/" in resource:
+        resource = resource.split("kaggle.com/models/", 1)[1]
+    elif "kaggle.com/datasets/" in resource:
+        resource = resource.split("kaggle.com/datasets/", 1)[1]
+    elif resource.startswith("models/"):
+        resource = resource[len("models/"):]
+    elif resource.startswith("datasets/"):
+        resource = resource[len("datasets/"):]
+
+    return resource.strip("/")
+
+
 def download_model_from_kaggle():
     """Tai models_student_6l tu Kaggle bang kagglehub.
 
-    - Handle dataset lay tu secrets/env KAGGLE_DATASET (mac dinh _DEFAULT_KAGGLE_DATASET).
-    - Dataset private can them KAGGLE_USERNAME + KAGGLE_KEY trong secrets/env.
+    - Dung KAGGLE_MODEL + kagglehub.model_download.
+    - Model private can them KAGGLE_USERNAME + KAGGLE_KEY trong secrets/env.
     Tra ve duong dan thu muc chua model, hoac None neu tai that bai.
     """
-    dataset = _get_secret("KAGGLE_DATASET", _DEFAULT_KAGGLE_DATASET)
-    if not dataset or dataset.startswith("<"):
+    resource = _normalize_kaggle_model_handle(
+        _get_secret("KAGGLE_MODEL", _DEFAULT_KAGGLE_MODEL)
+    )
+    if not resource or resource.startswith("<"):
         st.error(
-            "❌ Chưa cấu hình Kaggle dataset. Khai báo `KAGGLE_DATASET` "
-            "(dạng `username/dataset-slug`) trong secrets hoặc biến môi trường."
+            "❌ Chưa cấu hình Kaggle model. Khai báo `KAGGLE_MODEL` "
+            "(dạng `username/model-slug/pyTorch/default`) trong secrets hoặc biến môi trường."
         )
         return None
 
@@ -173,13 +193,13 @@ def download_model_from_kaggle():
         return None
 
     try:
-        with st.spinner(f"⬇️ Đang tải mô hình từ Kaggle (`{dataset}`)..."):
-            root = kagglehub.dataset_download(dataset)
+        with st.spinner(f"⬇️ Đang tải mô hình từ Kaggle (`{resource}`)..."):
+            root = kagglehub.model_download(resource)
     except Exception as e:
-        st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{dataset}`): {e}")
+        st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{resource}`): {e}")
         return None
 
-    # Tim thu muc model: goc dataset hoac thu muc con (vd. models_student_6l/)
+    # Tim thu muc model: goc model hoac thu muc con (vd. models_student_6l/)
     if _is_model_dir(root):
         return root
     for cur, _dirs, _files in os.walk(root):
@@ -187,7 +207,7 @@ def download_model_from_kaggle():
             return cur
 
     st.error(
-        f"❌ Dataset Kaggle `{dataset}` không chứa model hợp lệ "
+        f"❌ Model Kaggle `{resource}` không chứa model hợp lệ "
         "(cần `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`)."
     )
     return None
