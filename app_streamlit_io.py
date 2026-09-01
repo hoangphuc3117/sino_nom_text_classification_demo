@@ -1,32 +1,31 @@
 """
 Streamlit Demo for Sino-Nom Text Classification
-Using BERT-LSTM Model with 7 Classes
-Optimized for Streamlit Cloud deployment
+Distilled BERT 6 tầng (Jihuai/bert-ancient-chinese + 1,786 chữ Nôm) — 8 classes
+Model: models_student_6l — test acc 91.8%, 148 MB fp16, ~300 MB RAM, CPU-ready
+(chưng cất từ models_baseline_v2 — 92.4%; app tự fallback về bản đầy đủ nếu có)
+
+Thay thế pipeline BERT-LSTM/Decision-Templates cũ (7 lớp, macro-F1 0.838)
+bằng baseline chuẩn hiện tại (8 lớp, macro-F1 0.919):
+  - fine-tune toàn mạng thay vì BERT đóng băng + LSTM
+  - vocab mở rộng 1.786 chữ Nôm (CJK Ext-B), [UNK] 8.6% -> 1.2%
+  - thêm lớp Philosophy (Triết học)
+  - max_len 512 (cũ: 128)
+  - văn bản dài: cửa sổ trượt 280 ký tự + trung bình xác suất
+    (đọc toàn văn thay vì cắt cụt) — trả về MỘT nhãn tự tin nhất
 """
-import streamlit as st
-import numpy as np
-import torch
-import torch.nn as nn
-from transformers import BertModel, BertTokenizer
+import base64
+import io
 import json
 import os
-import re
-# Thêm các import cho OCR API
+import unicodedata
+
+import numpy as np
 import requests
-import base64
+import streamlit as st
+import torch
+import torch.nn as nn
 from PIL import Image
-import io
-import kagglehub
-# Thêm import cho Jiayan NLP với error handling
-# Disabled due to kenlm compatibility issues with Python 3.13
-try:
-    # from jiayan import load_lm, CRFSentencizer, CharHMMTokenizer
-    JIAYAN_AVAILABLE = False  # Force disable
-except ImportError:
-    JIAYAN_AVAILABLE = False
-    CRFSentencizer = None
-    CharHMMTokenizer = None
-    load_lm = None
+from transformers import AutoModel, AutoTokenizer
 
 # Set page config
 st.set_page_config(
@@ -38,7 +37,6 @@ st.set_page_config(
 # Custom CSS for better styling
 st.markdown("""
 <style>
-/* Custom styling for text areas */
 .stTextArea > div > div > textarea {
     font-family: 'Courier New', monospace !important;
     font-size: 14px !important;
@@ -49,18 +47,8 @@ st.markdown("""
     padding: 12px !important;
     line-height: 1.6 !important;
 }
-
-/* Compact margins for text areas */
-.stTextArea {
-    margin: 8px 0px !important;
-}
-
-/* Label styling */
-.stMarkdown p {
-    margin-bottom: 8px !important;
-}
-
-/* Result container styling */
+.stTextArea { margin: 8px 0px !important; }
+.stMarkdown p { margin-bottom: 8px !important; }
 .result-container {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     padding: 20px;
@@ -70,29 +58,23 @@ st.markdown("""
     text-align: center;
     box-shadow: 0 4px 15px rgba(0,0,0,0.1);
 }
-
 .result-title {
     font-size: 1.8em;
     font-weight: bold;
     margin: 0;
     text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
 }
-
 .result-subtitle {
     color: rgba(255,255,255,0.9);
     margin: 8px 0 0 0;
     font-size: 1em;
 }
-
-/* Confidence scores styling */
 .confidence-container {
     background: #f8f9fa;
     padding: 16px;
     border-radius: 8px;
     margin: 8px 0px;
 }
-
-/* Alert styling for Streamlit Cloud */
 .streamlit-info {
     background: #e1f5fe;
     padding: 16px;
@@ -103,218 +85,209 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Constants
-MODEL_DIR = "models_lstm_6class"
-BERT_MODEL_NAME = "Jihuai/bert-ancient-chinese"
-MAX_LEN = 128
+# ----------------------------------------------------------------- Constants
+# Thu muc mo hinh: uu tien secrets/env, roi cac duong dan local quen thuoc.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_MODEL_DIR_CANDIDATES = [
+    os.environ.get("MODEL_DIR", ""),
+    # uu tien student 6 tang (148MB fp16, ~300MB RAM, ~2x nhanh tren CPU)
+    "models_student_6l",
+    os.path.join(_APP_DIR, "models_student_6l"),
+    os.path.join(_APP_DIR, "..", "yhct_classification_model2", "models_student_6l"),
+    # du phong: mo hinh day du 12 tang
+    "models_baseline_v2",
+    os.path.join(_APP_DIR, "models_baseline_v2"),
+    os.path.join(_APP_DIR, "..", "yhct_classification_model2", "models_baseline_v2"),
+]
 
-# Hán-Nôm character processing functions
+CATEGORY_ICONS = {
+    "Admin": "🏛️",
+    "Medical": "🏥",
+    "History": "📚",
+    "Literature": "📖",
+    "Buddhism": "🪷",
+    "Catholics": "⛪",
+    "Philosophy": "☯️",
+    "Others": "📋",
+}
+CATEGORY_VI = {
+    "Admin": "Hành chính",
+    "Medical": "Y học",
+    "History": "Lịch sử",
+    "Literature": "Văn học",
+    "Buddhism": "Phật giáo",
+    "Catholics": "Công giáo",
+    "Philosophy": "Triết học",
+    "Others": "Khác",
+}
+
+# Cua so truot cho van ban dai (khop phan phoi huan luyen ~280 ky tu)
+WINDOW = 280
+OVERLAP = 50
+
+
+def resolve_model_dir():
+    """Tim thu muc mo hinh (models_baseline_v2) theo thu tu uu tien."""
+    try:
+        from_secrets = st.secrets.get("MODEL_DIR", "")
+    except Exception:
+        from_secrets = ""
+    for d in [from_secrets] + _MODEL_DIR_CANDIDATES:
+        if d and (os.path.exists(os.path.join(d, "model.pt"))
+                  or os.path.exists(os.path.join(d, "model_fp16.pt"))):
+            return os.path.abspath(d)
+    return None
+
+
+# ----------------------------------------------- Han-Nom character filtering
 def is_han_nom_char(char):
     """Kiểm tra xem ký tự có phải là Hán-Nôm không"""
-    # Kiểm tra các range Unicode cho chữ Hán
     return any([
-        '\u4e00' <= char <= '\u9fff',  # CJK Unified Ideographs
-        '\u3400' <= char <= '\u4dbf',  # CJK Extension A
-        '\u20000' <= char <= '\u2a6df', # CJK Extension B
-        '\u2a700' <= char <= '\u2b73f', # CJK Extension C
-        '\u2b740' <= char <= '\u2b81f', # CJK Extension D
-        '\u2b820' <= char <= '\u2ceaf', # CJK Extension E
-        '\u2ceb0' <= char <= '\u2ebef', # CJK Extension F
+        '一' <= char <= '鿿',   # CJK Unified Ideographs
+        '㐀' <= char <= '䶿',   # CJK Extension A
+        '\U00020000' <= char <= '\U0002a6df',  # CJK Extension B (chữ Nôm)
+        '\U0002a700' <= char <= '\U0002b73f',  # CJK Extension C
+        '\U0002b740' <= char <= '\U0002b81f',  # CJK Extension D
+        '\U0002b820' <= char <= '\U0002ceaf',  # CJK Extension E
+        '\U0002ceb0' <= char <= '\U0002ebef',  # CJK Extension F
     ])
 
-def filter_han_nom_text(text):
-    """Lọc chỉ giữ lại ký tự Hán-Nôm"""
-    return ''.join([char for char in text if is_han_nom_char(char)])
-
-@st.cache_resource
-def load_jiayan_models():
-    """Load Jiayan models - disabled due to kenlm compatibility issues"""
-    return None, None
 
 def preprocess_han_nom_text(text):
-    """Tiền xử lý văn bản Hán-Nôm: chỉ lọc ký tự Hán-Nôm"""
-    # Lọc chỉ giữ ký tự Hán-Nôm
-    filtered_text = filter_han_nom_text(text)
-    
-    if not filtered_text.strip():
-        return ""
-    
-    return filtered_text
+    """Tiền xử lý: chuẩn hoá NFC rồi lọc chỉ giữ ký tự Hán-Nôm."""
+    text = unicodedata.normalize("NFC", text)
+    filtered = ''.join(c for c in text if is_han_nom_char(c))
+    return filtered.strip()
 
-# Model Definition
-class BertLSTMClassifier(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=256, num_layers=3, dropout=0.5, num_classes=7):
+
+# ------------------------------------------------- Model (student / teacher)
+class HanNomClassifier(nn.Module):
+    """BERT fine-tuned + masked mean-pooling + Linear(768 -> 8).
+
+    Giong het kien truc huan luyen trong han_nom_classification_v2.ipynb.
+    """
+
+    def __init__(self, base_model, emb_rows, num_classes, num_layers=None):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_dim, hidden_dim, num_layers,
-            batch_first=True, dropout=dropout, bidirectional=True
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_dim * 2, num_classes)
-    
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        out = self.dropout(lstm_out)
-        out = self.fc(out)
-        return out
+        self.bert = AutoModel.from_pretrained(base_model)
+        if emb_rows != self.bert.config.vocab_size:
+            self.bert.resize_token_embeddings(emb_rows)   # +1.786 chu Nom
+        if num_layers and num_layers < len(self.bert.encoder.layer):
+            # student chung cat: giu dung so tang truoc khi nap trong so
+            self.bert.encoder.layer = nn.ModuleList(self.bert.encoder.layer[:num_layers])
+            self.bert.config.num_hidden_layers = num_layers
+        self.dropout = nn.Dropout(0.1)
+        self.fc = nn.Linear(self.bert.config.hidden_size, num_classes)
+
+    def forward(self, input_ids, attention_mask):
+        h = self.bert(input_ids, attention_mask=attention_mask).last_hidden_state
+        m = attention_mask.unsqueeze(-1).float()
+        pooled = (h * m).sum(1) / m.sum(1).clamp(min=1)   # mean-pool bo padding
+        return self.fc(self.dropout(pooled))
+
 
 @st.cache_resource
 def load_models():
-    """Load all models and templates with error handling for Streamlit Cloud"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    try:
-        # Load class info
-        class_info_path = os.path.join(MODEL_DIR, "class_info.json")
-        if not os.path.exists(class_info_path):
-            st.error(f"❌ Không tìm thấy file {class_info_path}")
-            return None
-            
-        with open(class_info_path, "r") as f:
-            class_info = json.load(f)
-        
-        class_names = class_info["class_names"]
-        num_classes = class_info["num_classes"]
-        
-        # Load BERT model and tokenizer
-        tokenizer = BertTokenizer.from_pretrained(BERT_MODEL_NAME)
-        bert_model = BertModel.from_pretrained(BERT_MODEL_NAME, use_safetensors=True).to(device)
-        bert_model.eval()
-        
-        # Load LSTM classifier
-        lstm_model = BertLSTMClassifier(num_classes=num_classes).to(device)
-        model_path = os.path.join(MODEL_DIR, "best_model.pt")
-        if not os.path.exists(model_path):
-            st.error(f"❌ Không tìm thấy file mô hình {model_path}")
-            return None
-            
-        lstm_model.load_state_dict(torch.load(model_path, map_location=device))
-        lstm_model.eval()
-        
-        # Load templates
-        templates = {}
-        for i, name in enumerate(class_names):
-            template_file = os.path.join(MODEL_DIR, f"template_{name.lower()}.npy")
-            if os.path.exists(template_file):
-                templates[i] = np.load(template_file)
-            else:
-                st.warning(f"⚠️ Không tìm thấy template file {template_file}")
-                # Tạo template mặc định
-                templates[i] = np.random.random((128, 768))
-        
-        return tokenizer, bert_model, lstm_model, templates, class_names, num_classes, device
-        
-    except Exception as e:
-        st.error(f"❌ Lỗi khi tải models: {e}")
+    """Load tokenizer + mo hinh (uu tien student 6 tang, fallback baseline v2)."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    model_dir = resolve_model_dir()
+    if model_dir is None:
+        st.error(
+            "❌ Không tìm thấy thư mục mô hình `models_baseline_v2` "
+            "(cần `model.pt`, `tokenizer/`, `meta.json`).\n\n"
+            "Đặt thư mục cạnh app, hoặc khai báo `MODEL_DIR` trong secrets/biến môi trường."
+        )
         return None
 
-def extract_bert_features(text, tokenizer, bert_model, device, max_len=128):
-    """Extract BERT features from text - optimized version"""
-    with torch.no_grad():
-        encoded = tokenizer(
-            text, 
-            padding='max_length', 
-            truncation=True, 
-            max_length=max_len, 
-            return_tensors='pt'
-        )
-        
-        input_ids = encoded['input_ids'].to(device)
-        attention_mask = encoded['attention_mask'].to(device)
-        
-        outputs = bert_model(input_ids, attention_mask=attention_mask)
-        # Giữ tensor trên device để tránh chuyển đổi không cần thiết
-        features = outputs.last_hidden_state
-    
-    return features
+    try:
+        meta = json.load(open(os.path.join(model_dir, "meta.json"), encoding="utf-8"))
+        tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+        model = HanNomClassifier(meta["base_model"], meta["emb_rows"],
+                                 len(meta["classes"]), meta.get("num_layers"))
+        fp16_path = os.path.join(model_dir, "model_fp16.pt")
+        ckpt = fp16_path if os.path.exists(fp16_path) else os.path.join(model_dir, "model.pt")
+        state = torch.load(ckpt, map_location="cpu")
+        # checkpoint fp16 -> ep ve fp32 de chay CPU (CPU khong ho tro fp16 tot)
+        state = {k: (v.float() if v.is_floating_point() else v) for k, v in state.items()}
+        model.load_state_dict(state)
+        model.to(device).eval()
+        meta["_model_dir"] = model_dir
+        meta["_checkpoint"] = os.path.basename(ckpt)
+        return tokenizer, model, meta, device
+    except Exception as e:
+        st.error(f"❌ Lỗi khi tải mô hình từ {model_dir}: {e}")
+        return None
 
-def make_prob_table(logits, num_classes=7):
-    """Convert logits to probability table using softmax - optimized version"""
-    # Tránh chuyển đổi không cần thiết nếu logits đã là tensor
-    if isinstance(logits, torch.Tensor):
-        probs = torch.softmax(logits, dim=-1)
+
+# ------------------------------------------------------------ Inference
+@torch.no_grad()
+def _predict_probs(texts, tokenizer, model, meta, device, batch_size=16):
+    """Xac suat 8 lop cho danh sach doan van (pad dong theo batch)."""
+    out = []
+    for k in range(0, len(texts), batch_size):
+        chunk = texts[k:k + batch_size]
+        enc = tokenizer(chunk, padding=True, truncation=True,
+                        max_length=meta["max_len"], return_tensors="pt")
+        logits = model(enc["input_ids"].to(device), enc["attention_mask"].to(device)).float()
+        out.append(torch.softmax(logits, -1).cpu().numpy())
+    return np.concatenate(out, axis=0)
+
+
+def classify_text(text, tokenizer, model, meta, device):
+    """Phan loai mot van ban BAT KY do dai — tra ve MOT nhan tu tin nhat.
+
+    - Van ban ngan/vua (<= WINDOW*1.5 ky tu): phan loai truc tiep.
+    - Van ban dai: cat cua so WINDOW ky tu (chong lan OVERLAP), phan loai
+      tung cua so roi TRUNG BINH xac suat — doc duoc toan van thay vi
+      chi 512 token dau nhu cach cat cut cu.
+    """
+    text = text.strip()
+    if len(text) <= int(WINDOW * 1.5):
+        spans = [text]
     else:
-        probs = torch.softmax(torch.FloatTensor(logits), dim=-1)
-    return probs
+        step = WINDOW - OVERLAP
+        spans = [text[i:i + WINDOW] for i in range(0, len(text) - OVERLAP, step)]
+        spans = [s for s in spans if len(s) >= 30] or [text[:WINDOW]]
 
-def predict_with_templates(prob_table, templates, num_classes=7):
-    """Classify using nearest template (Euclidean distance) - optimized version"""
-    # Chuyển prob_table sang numpy nếu là tensor
-    if isinstance(prob_table, torch.Tensor):
-        prob_table_np = prob_table.cpu().numpy()
-    else:
-        prob_table_np = prob_table
-    
-    batch_size = prob_table_np.shape[0]
-    distances = np.full((batch_size, num_classes), np.inf)
-    
-    # Vectorized computation cho tất cả templates cùng lúc
-    for class_id in range(num_classes):
-        if class_id in templates:
-            # Tính squared difference một lần, sau đó sum và sqrt
-            diff = prob_table_np - templates[class_id]
-            distances[:, class_id] = np.linalg.norm(diff.reshape(batch_size, -1), axis=1)
-    
-    pred_idx = np.argmin(distances, axis=1)
-    return pred_idx, distances
+    probs = _predict_probs(spans, tokenizer, model, meta, device)
+    p = probs.mean(axis=0)
+    order = np.argsort(p)[::-1]
+    classes = meta["classes"]
+    return {
+        "label": classes[int(order[0])],
+        "confidence": float(p[order[0]]),
+        "n_windows": len(spans),
+        "all_probs": {classes[int(i)]: float(p[i]) for i in order},
+    }
 
-def classify_text(text, tokenizer, bert_model, lstm_model, templates, class_names, num_classes, device):
-    """Classify a single text - optimized version"""
-    with torch.no_grad():
-        # Extract BERT features (đã ở dạng tensor trên device)
-        features = extract_bert_features(text, tokenizer, bert_model, device)
-        
-        # Get LSTM logits (giữ trên device)
-        logits = lstm_model(features)
-        
-        # Get probability table (giữ dạng tensor)
-        prob_table = make_prob_table(logits, num_classes)
-    
-    # Predict with templates (chuyển sang numpy chỉ khi cần)
-    pred_idx, distances = predict_with_templates(prob_table, templates, num_classes)
-    
-    # Calculate confidence (inverse of distance, normalized)
-    all_dists = distances[0]
-    
-    # Convert distances to similarity scores (inverse) - sử dụng numpy operations hiệu quả hơn
-    similarities = 1.0 / (1.0 + all_dists)
-    confidence = similarities / np.sum(similarities)
-    
-    return class_names[pred_idx[0]], confidence, pred_idx[0]
 
-# OCR API Configuration - sử dụng external API hoặc secrets
+# ------------------------------------------------------------ OCR API
 def get_ocr_api_url():
     """Get OCR API URL from secrets or use default"""
     try:
-        # Thử lấy từ Streamlit secrets
-        return st.secrets.get("OCR_API_URL", "https://kimhannom.clc.hcmus.edu.vn/meta-ocr-normal/nom-ocr")
-    except:
-        # Fallback URL
+        return st.secrets.get("OCR_API_URL",
+                              "https://kimhannom.clc.hcmus.edu.vn/meta-ocr-normal/nom-ocr")
+    except Exception:
         return "https://kimhannom.clc.hcmus.edu.vn/meta-ocr-normal/nom-ocr"
+
 
 def call_ocr_api(base64_image):
     """Call OCR API with error handling"""
     try:
-        headers = {
-            'User-Agent': 'StreamlitApp',
-            'Content-Type': 'application/json'
-        }
-        
+        headers = {'User-Agent': 'StreamlitApp', 'Content-Type': 'application/json'}
         if isinstance(base64_image, bytes):
             base64_str = base64.b64encode(base64_image).decode('utf-8')
         else:
             base64_str = base64_image
-
-        payload = {
-            "base64Data": base64_str, 
-            "lang_type": 2, 
-            "reading_direction": 1
-        }
-        
-        ocr_url = get_ocr_api_url()
-        response = requests.post(ocr_url, json=payload, headers=headers, verify=False, timeout=120)
-        return response
-        
+        payload = {"base64Data": base64_str, "lang_type": 2, "reading_direction": 1}
+        return requests.post(get_ocr_api_url(), json=payload, headers=headers,
+                             verify=False, timeout=120)
     except requests.exceptions.Timeout:
         st.error("⏱️ OCR API timeout. Vui lòng thử lại.")
         return None
@@ -325,28 +298,23 @@ def call_ocr_api(base64_image):
         st.error(f"❌ Lỗi khi gọi OCR API: {e}")
         return None
 
+
 def run_ocr_on_image(image_bytes):
     """Perform OCR using external API with error handling"""
     try:
-        # Đảm bảo image_bytes là bytes hợp lệ
         if not isinstance(image_bytes, bytes) or len(image_bytes) == 0:
             return '', None
-            
-        # Validate image format
-        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        Image.open(io.BytesIO(image_bytes)).convert('RGB')
     except Exception as e:
         st.error(f"❌ Lỗi khi xử lý ảnh: {str(e)}")
         return '', None
-    
-    # Gọi OCR API
+
     api_result = call_ocr_api(image_bytes)
     if not api_result:
         return '', None
-    
+
     raw_text = ""
     ocr_text_list = []
-    
-    # Xử lý kết quả từ API
     if api_result.status_code == 200:
         try:
             ocr_response_json = api_result.json()
@@ -358,77 +326,91 @@ def run_ocr_on_image(image_bytes):
     else:
         st.error(f"❌ OCR API trả về lỗi: {api_result.status_code}")
         return '', None
-    
-    if raw_text:
-        # Hiển thị văn bản đã nhận diện từng câu xuống dòng
-        st.markdown("**Văn bản đã nhận diện:**")
-        # Hiển thị từng câu trên một dòng riêng
-        if ocr_text_list:
-            ocr_display = "\n".join(ocr_text_list)
-        else:
-            ocr_display = raw_text
-        st.text_area("Văn bản gốc", value=ocr_display, height=300, disabled=False, label_visibility="hidden")
 
-        # Tiền xử lý văn bản Hán-Nôm (chỉ lọc ký tự)
-        if raw_text.strip():
-            processed_text = preprocess_han_nom_text(raw_text)
-            
-            if processed_text:
-                return processed_text, api_result
-            else:
-                st.info("💡 Sử dụng văn bản gốc do không có ký tự Hán-Nôm.")
-                return raw_text, api_result
-    else:
-        st.warning("⚠️ Không phát hiện văn bản trong ảnh.")
-    
+    if raw_text:
+        st.markdown("**Văn bản đã nhận diện:**")
+        ocr_display = "\n".join(ocr_text_list) if ocr_text_list else raw_text
+        st.text_area("Văn bản gốc", value=ocr_display, height=300,
+                     disabled=False, label_visibility="hidden")
+        processed_text = preprocess_han_nom_text(raw_text)
+        if processed_text:
+            return processed_text, api_result
+        st.info("💡 Sử dụng văn bản gốc do không có ký tự Hán-Nôm.")
+        return raw_text, api_result
+
+    st.warning("⚠️ Không phát hiện văn bản trong ảnh.")
     return raw_text, api_result
+
+
+# ------------------------------------------------------------ UI helpers
+def render_result(result):
+    """Hien thi ket qua phan loai: MOT nhan + bang do tin cay top-3."""
+    label = result["label"]
+    main_col, conf_col = st.columns([1, 1])
+
+    with main_col:
+        st.markdown(f"""
+        <div class="result-container">
+            <h2 class="result-title">
+                {CATEGORY_ICONS.get(label, '📄')} {label}
+            </h2>
+            <p class="result-subtitle">
+                {CATEGORY_VI.get(label, label)} — độ tin cậy {result['confidence']:.1%}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        if result["n_windows"] > 1:
+            st.caption(f"📏 Văn bản dài — đã đọc bằng {result['n_windows']} cửa sổ "
+                       f"{WINDOW} ký tự và trung bình xác suất.")
+
+    with conf_col:
+        st.markdown('<div class="confidence-container">', unsafe_allow_html=True)
+        st.markdown("**Độ tin cậy (top 3):**")
+        for i, (name, conf) in enumerate(list(result["all_probs"].items())[:3]):
+            icon = CATEGORY_ICONS.get(name, '📄')
+            if i == 0:
+                st.success(f"{icon} {name} ({CATEGORY_VI.get(name, name)}): {conf:.1%}")
+            else:
+                st.info(f"{icon} {name} ({CATEGORY_VI.get(name, name)}): {conf:.1%}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
 
 def main():
     st.title("📜 Sino-Nom Text Classification")
-    st.markdown("### Phân loại văn bản Hán-Nôm sử dụng mô hình BERT-LSTM")
-    
-    # Streamlit Cloud info
+    st.markdown("### Phân loại văn bản Hán-Nôm — fine-tuned BERT, 8 lĩnh vực")
+
     st.markdown("""
     <div class="streamlit-info">
-        <strong>🚀 Deployed on Streamlit Cloud</strong><br>
-        Ứng dụng này sử dụng BERT-LSTM để phân loại văn bản Hán-Nôm thành 7 loại: Hành chính, Y học, Lịch sử, Văn học, Phật giáo, Công giáo, và Khác.
+        <strong>Mô hình student 6 tầng</strong> — chưng cất (knowledge distillation)
+        từ baseline fine-tuned <code>Jihuai/bert-ancient-chinese</code> + 1.786 chữ Nôm.<br>
+        Nhẹ cho CPU: <strong>148 MB</strong> (fp16) · ~300 MB RAM · ~24 ms/đoạn.
+        Độ chính xác test: <strong>91,8%</strong> (mô hình đầy đủ: 92,4%).
+        Văn bản dài được đọc <em>toàn văn</em> bằng cửa sổ trượt.
     </div>
     """, unsafe_allow_html=True)
-    
+
     st.markdown("---")
-    
-    # Load models with progress indicator
+
     model_data = None
     with st.spinner("🔄 Đang tải mô hình... (có thể mất vài phút lần đầu)"):
         model_data = load_models()
-    
+
     if not model_data:
-        st.error("❌ Không thể tải mô hình. Vui lòng kiểm tra lại.")
         st.stop()
-        
-    tokenizer, bert_model, lstm_model, templates, class_names, num_classes, device = model_data
-    st.success(f"✅ Đã tải mô hình thành công! (Device: {device})")
-    
-    # Display class labels
+
+    tokenizer, model, meta, device = model_data
+    class_names = meta["classes"]
+    n_layers = meta.get("num_layers", 12)
+    st.success(f"✅ Đã tải mô hình ({n_layers} tầng, {meta.get('_checkpoint','model.pt')}) — Device: {device}")
+
     st.markdown("**Các loại văn bản (Categories):**")
-    cols = st.columns(7)
-    category_icons = {
-        "Admin": "🏛️",
-        "Medical": "🏥",
-        "History": "📚", 
-        "Literature": "📖",
-        "Buddhism": "🪷",
-        "Catholics": "⛪",
-        "Others": "📋"
-    }
-    
-    for i, (col, name) in enumerate(zip(cols, class_names)):
+    cols = st.columns(len(class_names))
+    for col, name in zip(cols, class_names):
         with col:
-            st.info(f"{category_icons.get(name, '📄')} {name}")
-    
+            st.info(f"{CATEGORY_ICONS.get(name, '📄')} {name}")
+
     st.markdown("---")
-    
-    # Upload image or text input
+
     st.markdown("### 📝 Nhập văn bản hoặc upload hình ảnh để phân loại")
     tab1, tab2 = st.tabs(["📤 Upload hình ảnh", "✏️ Nhập văn bản"])
 
@@ -439,14 +421,11 @@ def main():
             type=["jpg", "jpeg", "png"],
             help="Hỗ trợ các định dạng: JPG, JPEG, PNG. Kích thước tối đa: 200MB"
         )
-        
+
         if uploaded_file is not None:
-            # Đọc bytes từ file uploader
             image_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file.read()
-            
-            # Layout responsive
             img_col, result_col = st.columns([1, 2])
-            
+
             with img_col:
                 try:
                     image = Image.open(io.BytesIO(image_bytes))
@@ -454,50 +433,16 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Lỗi hiển thị ảnh: {str(e)}")
                     st.stop()
-            
+
             with result_col:
-                # Thực hiện OCR và phân loại
                 with st.spinner("🔄 Đang nhận diện và phân loại..."):
-                    text_from_image, ocr_result = run_ocr_on_image(image_bytes)
-                
+                    text_from_image, _ = run_ocr_on_image(image_bytes)
+
                 if text_from_image and text_from_image.strip():
-                    # Phân loại văn bản
                     with st.spinner("🤖 Đang phân loại nội dung..."):
-                        pred_label, confidence, pred_idx = classify_text(
-                            text_from_image, tokenizer, bert_model, lstm_model, 
-                            templates, class_names, num_classes, device
-                        )
-                    
-                    # Hiển thị kết quả
+                        result = classify_text(text_from_image, tokenizer, model, meta, device)
                     st.markdown("### 📊 Kết quả phân loại tự động")
-                    
-                    main_result, confidence_scores = st.columns([1, 1])
-                    
-                    with main_result:
-                        st.markdown(f"""
-                        <div class="result-container">
-                            <h2 class="result-title">
-                                {category_icons.get(pred_label, '📄')} {pred_label}
-                            </h2>
-                            <p class="result-subtitle">
-                                Phân loại: {pred_label}
-                            </p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    with confidence_scores:
-                        st.markdown('<div class="confidence-container">', unsafe_allow_html=True)
-                        st.markdown("**Độ tin cậy:**")
-                        sorted_indices = np.argsort(confidence)[::-1]
-                        for idx in sorted_indices[:3]:
-                            name = class_names[idx]
-                            conf = confidence[idx]
-                            icon = category_icons.get(name, '📄')
-                            if idx == pred_idx:
-                                st.success(f"{icon} {name}: {conf:.1%}")
-                            else:
-                                st.info(f"{icon} {name}: {conf:.1%}")
-                        st.markdown('</div>', unsafe_allow_html=True)
+                    render_result(result)
                 else:
                     st.warning("⚠️ Không nhận diện được nội dung từ ảnh.")
 
@@ -506,62 +451,34 @@ def main():
         text_input = st.text_area(
             "Văn bản Hán-Nôm:",
             height=300,
-            placeholder="Nhập văn bản Hán-Nôm vào đây...\\n(Ví dụ: 運衰死沙場宣立萬春國)",
-            help="Nhập văn bản cần phân loại. Văn bản có thể bằng chữ Hán, chữ Nôm, hoặc hỗn hợp."
+            placeholder="Nhập văn bản Hán-Nôm vào đây...\n(Ví dụ: 運衰死沙場宣立萬春國)",
+            help="Văn bản có thể bằng chữ Hán, chữ Nôm, hoặc hỗn hợp — ngắn hay dài đều được, "
+                 "văn bản dài sẽ được đọc toàn văn bằng cửa sổ trượt."
         )
-        
+
         if st.button("🔍 Phân loại văn bản", type="primary", key="classify_text"):
-            if not text_input.strip():
+            cleaned = preprocess_han_nom_text(text_input) or text_input.strip()
+            if not cleaned:
                 st.warning("⚠️ Vui lòng nhập văn bản để phân loại!")
             else:
                 with st.spinner("🔄 Đang phân loại..."):
-                    pred_label, confidence, pred_idx = classify_text(
-                        text_input, tokenizer, bert_model, lstm_model, 
-                        templates, class_names, num_classes, device
-                    )
-                
+                    result = classify_text(cleaned, tokenizer, model, meta, device)
                 st.markdown("---")
                 st.markdown("### 📊 Kết quả phân loại")
-                
-                result_col1, result_col2 = st.columns([1, 1])
-                with result_col1:
-                    st.markdown(f"""
-                    <div class="result-container">
-                        <h2 class="result-title">
-                            {category_icons.get(pred_label, '📄')} {pred_label}
-                        </h2>
-                        <p class="result-subtitle">
-                            Phân loại: {pred_label}
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with result_col2:
-                    st.markdown('<div class="confidence-container">', unsafe_allow_html=True)
-                    st.markdown("**Độ tin cậy:**")
-                    sorted_indices = np.argsort(confidence)[::-1]
-                    for idx in sorted_indices[:3]:
-                        name = class_names[idx]
-                        conf = confidence[idx]
-                        icon = category_icons.get(name, '📄')
-                        if idx == pred_idx:
-                            st.success(f"{icon} {name}: {conf:.1%}")
-                        else:
-                            st.info(f"{icon} {name}: {conf:.1%}")
-                    st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Footer
+                render_result(result)
+
     st.markdown("---")
     st.markdown(
         """
         <div style="text-align: center; color: gray;">
-            <p>📜 <strong>Sino-Nom Text Classification</strong> | BERT-LSTM Model</p>
-            <p>7 Classes: Admin, Medical, History, Literature, Buddhism, Catholics, Others</p>
-            <p><em>🚀 Powered by Streamlit Cloud</em></p>
+            <p>📜 <strong>Sino-Nom Text Classification</strong> | Distilled BERT 6-layer (bert-ancient-chinese + chữ Nôm)</p>
+            <p>8 Classes: Admin, Medical, History, Literature, Buddhism, Catholics, Philosophy, Others</p>
+            <p><em>Student: 91.8% acc · 148 MB · CPU-ready | Teacher: 92.4% acc</em></p>
         </div>
         """,
         unsafe_allow_html=True
     )
+
 
 if __name__ == "__main__":
     main()
