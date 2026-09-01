@@ -1,0 +1,60 @@
+{
+ "classes": [
+  "Admin",
+  "Medical",
+  "History",
+  "Literature",
+  "Buddhism",
+  "Catholics",
+  "Philosophy",
+  "Others"
+ ],
+ "others_name": "Others",
+ "others_as_class": true,
+ "others_threshold": 0.0,
+ "max_len": 512,
+ "emb_rows": 39994,
+ "base_model": "Jihuai/bert-ancient-chinese",
+ "n_new_tokens": 1786,
+ "test_macro_f1": 0.9162017010881824,
+ "test_accuracy": 0.9177080158488266,
+ "baseline_svm_macro_f1": 0.9053126678304866,
+ "config": {
+  "DATA_DIR": "dataset_by_label_4",
+  "VOCAB_EXT": "vocab_1.txt",
+  "MODEL_NAME": "Jihuai/bert-ancient-chinese",
+  "OUT_DIR": "models_baseline_v2",
+  "MAX_LEN": 512,
+  "BATCH_SIZE": 32,
+  "GRAD_ACCUM": 1,
+  "EVAL_BS": 128,
+  "AMP": true,
+  "BUCKET_BY_LEN": true,
+  "EPOCHS": 3,
+  "LR": 3e-05,
+  "WEIGHT_DECAY": 0.01,
+  "WARMUP_PCT": 0.1,
+  "CLASS_WEIGHT_POWER": 1.0,
+  "TEST_SIZE": 0.15,
+  "VAL_SIZE": 0.15,
+  "SEEDS": [
+   42
+  ],
+  "SPLIT_FILE": "split_seed42.json",
+  "OTHERS_AS_CLASS": true
+ },
+ "num_layers": 6,
+ "distilled_from": "models_baseline_v2",
+ "val_history": [
+  0.8965,
+  0.9037,
+  0.9008,
+  0.9039,
+  0.9042,
+  0.9108,
+  0.9059,
+  0.9109,
+  0.9127,
+  0.9135
+ ]
+}

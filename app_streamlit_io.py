@@ -2,7 +2,7 @@
 Streamlit Demo for Sino-Nom Text Classification
 Distilled BERT 6 tầng (Jihuai/bert-ancient-chinese + 1,786 chữ Nôm) — 8 classes
 Model: models_student_6l — test acc 91.8%, 148 MB fp16, ~300 MB RAM, CPU-ready
-(chưng cất từ models_baseline_v2 — 92.4%; app tự fallback về bản đầy đủ nếu có)
+Nếu không có model local, app tự tải models_student_6l từ Kaggle (kagglehub).
 
 Thay thế pipeline BERT-LSTM/Decision-Templates cũ (7 lớp, macro-F1 0.838)
 bằng baseline chuẩn hiện tại (8 lớp, macro-F1 0.919):
@@ -87,18 +87,18 @@ st.markdown("""
 
 # ----------------------------------------------------------------- Constants
 # Thu muc mo hinh: uu tien secrets/env, roi cac duong dan local quen thuoc.
+# Chi dung student 6 tang (148MB fp16, ~300MB RAM, ~2x nhanh tren CPU).
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_DIR_CANDIDATES = [
     os.environ.get("MODEL_DIR", ""),
-    # uu tien student 6 tang (148MB fp16, ~300MB RAM, ~2x nhanh tren CPU)
     "models_student_6l",
     os.path.join(_APP_DIR, "models_student_6l"),
     os.path.join(_APP_DIR, "..", "yhct_classification_model2", "models_student_6l"),
-    # du phong: mo hinh day du 12 tang
-    "models_baseline_v2",
-    os.path.join(_APP_DIR, "models_baseline_v2"),
-    os.path.join(_APP_DIR, "..", "yhct_classification_model2", "models_baseline_v2"),
 ]
+
+# Kaggle dataset chua thu muc models_student_6l (model_fp16.pt, tokenizer/, meta.json).
+# Sua handle nay theo dataset cua ban, hoac ghi de bang secrets/env KAGGLE_DATASET.
+_DEFAULT_KAGGLE_DATASET = "phuchoangnguyen/sinonomtext-bert-fp16/pyTorch/default"
 
 CATEGORY_ICONS = {
     "Admin": "🏛️",
@@ -126,17 +126,80 @@ WINDOW = 280
 OVERLAP = 50
 
 
-def resolve_model_dir():
-    """Tim thu muc mo hinh (models_baseline_v2) theo thu tu uu tien."""
+def _is_model_dir(d):
+    """Thu muc hop le: co checkpoint (fp16 hoac fp32) + meta.json."""
+    return bool(d) and os.path.exists(os.path.join(d, "meta.json")) and (
+        os.path.exists(os.path.join(d, "model_fp16.pt"))
+        or os.path.exists(os.path.join(d, "model.pt"))
+    )
+
+
+def _get_secret(key, default=""):
+    """Doc tu st.secrets, fallback ve bien moi truong."""
     try:
-        from_secrets = st.secrets.get("MODEL_DIR", "")
+        val = st.secrets.get(key, "")
+        if val:
+            return val
     except Exception:
-        from_secrets = ""
-    for d in [from_secrets] + _MODEL_DIR_CANDIDATES:
-        if d and (os.path.exists(os.path.join(d, "model.pt"))
-                  or os.path.exists(os.path.join(d, "model_fp16.pt"))):
-            return os.path.abspath(d)
+        pass
+    return os.environ.get(key, default)
+
+
+def download_model_from_kaggle():
+    """Tai models_student_6l tu Kaggle bang kagglehub.
+
+    - Handle dataset lay tu secrets/env KAGGLE_DATASET (mac dinh _DEFAULT_KAGGLE_DATASET).
+    - Dataset private can them KAGGLE_USERNAME + KAGGLE_KEY trong secrets/env.
+    Tra ve duong dan thu muc chua model, hoac None neu tai that bai.
+    """
+    dataset = _get_secret("KAGGLE_DATASET", _DEFAULT_KAGGLE_DATASET)
+    if not dataset or dataset.startswith("<"):
+        st.error(
+            "❌ Chưa cấu hình Kaggle dataset. Khai báo `KAGGLE_DATASET` "
+            "(dạng `username/dataset-slug`) trong secrets hoặc biến môi trường."
+        )
+        return None
+
+    # kagglehub doc credentials tu env — day secrets vao env neu co
+    for key in ("KAGGLE_USERNAME", "KAGGLE_KEY"):
+        val = _get_secret(key)
+        if val:
+            os.environ[key] = val
+
+    try:
+        import kagglehub
+    except ImportError:
+        st.error("❌ Thiếu thư viện `kagglehub`. Cài bằng: `pip install kagglehub`")
+        return None
+
+    try:
+        with st.spinner(f"⬇️ Đang tải mô hình từ Kaggle (`{dataset}`)..."):
+            root = kagglehub.dataset_download(dataset)
+    except Exception as e:
+        st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{dataset}`): {e}")
+        return None
+
+    # Tim thu muc model: goc dataset hoac thu muc con (vd. models_student_6l/)
+    if _is_model_dir(root):
+        return root
+    for cur, _dirs, _files in os.walk(root):
+        if _is_model_dir(cur):
+            return cur
+
+    st.error(
+        f"❌ Dataset Kaggle `{dataset}` không chứa model hợp lệ "
+        "(cần `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`)."
+    )
     return None
+
+
+def resolve_model_dir():
+    """Tim thu muc mo hinh student local; khong co thi tai tu Kaggle."""
+    for d in [_get_secret("MODEL_DIR")] + _MODEL_DIR_CANDIDATES:
+        if _is_model_dir(d):
+            return os.path.abspath(d)
+    kaggle_dir = download_model_from_kaggle()
+    return os.path.abspath(kaggle_dir) if kaggle_dir else None
 
 
 # ----------------------------------------------- Han-Nom character filtering
@@ -160,7 +223,7 @@ def preprocess_han_nom_text(text):
     return filtered.strip()
 
 
-# ------------------------------------------------- Model (student / teacher)
+# ------------------------------------------------------- Model (student 6L)
 class HanNomClassifier(nn.Module):
     """BERT fine-tuned + masked mean-pooling + Linear(768 -> 8).
 
@@ -188,7 +251,7 @@ class HanNomClassifier(nn.Module):
 
 @st.cache_resource
 def load_models():
-    """Load tokenizer + mo hinh (uu tien student 6 tang, fallback baseline v2)."""
+    """Load tokenizer + mo hinh student 6 tang (local, hoac tai tu Kaggle)."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -199,9 +262,10 @@ def load_models():
     model_dir = resolve_model_dir()
     if model_dir is None:
         st.error(
-            "❌ Không tìm thấy thư mục mô hình `models_baseline_v2` "
-            "(cần `model.pt`, `tokenizer/`, `meta.json`).\n\n"
-            "Đặt thư mục cạnh app, hoặc khai báo `MODEL_DIR` trong secrets/biến môi trường."
+            "❌ Không tìm thấy mô hình `models_student_6l` "
+            "(cần `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`).\n\n"
+            "Đặt thư mục cạnh app, khai báo `MODEL_DIR`, hoặc cấu hình "
+            "`KAGGLE_DATASET` trong secrets/biến môi trường để tải từ Kaggle."
         )
         return None
 
@@ -473,7 +537,7 @@ def main():
         <div style="text-align: center; color: gray;">
             <p>📜 <strong>Sino-Nom Text Classification</strong> | Distilled BERT 6-layer (bert-ancient-chinese + chữ Nôm)</p>
             <p>8 Classes: Admin, Medical, History, Literature, Buddhism, Catholics, Philosophy, Others</p>
-            <p><em>Student: 91.8% acc · 148 MB · CPU-ready | Teacher: 92.4% acc</em></p>
+            <p><em>Student 6-layer: 91.8% acc · 148 MB fp16 · CPU-ready</em></p>
         </div>
         """,
         unsafe_allow_html=True
