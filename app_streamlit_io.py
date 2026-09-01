@@ -19,13 +19,20 @@ import json
 import os
 import unicodedata
 
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
 import numpy as np
 import requests
 import streamlit as st
 import torch
 import torch.nn as nn
 from PIL import Image
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, PreTrainedTokenizerFast
+
+torch.set_num_threads(4)
+if hasattr(torch, "set_num_interop_threads"):
+    torch.set_num_interop_threads(1)
 
 # Set page config
 st.set_page_config(
@@ -97,8 +104,9 @@ _MODEL_DIR_CANDIDATES = [
 ]
 
 # Kaggle model chua thu muc models_student_6l (model_fp16.pt, tokenizer/, meta.json).
-# Sua handle nay theo model cua ban, hoac ghi de bang secrets/env KAGGLE_MODEL.
-_DEFAULT_KAGGLE_MODEL = "phuchoangnguyen/sinonomtext-bert-fp16/pyTorch/default"
+# Uu tien fp16 de test ban nhe truoc; full la fallback.
+_DEFAULT_KAGGLE_MODEL_FP16 = "phuchoangnguyen/sinonomtext-bert-fp16/pyTorch/default"
+_DEFAULT_KAGGLE_MODEL_FULL = "phuchoangnguyen/sinonomtext-bert/pyTorch/default"
 
 CATEGORY_ICONS = {
     "Admin": "🏛️",
@@ -212,6 +220,37 @@ def _find_model_bundle(root):
     return None
 
 
+def _load_tokenizer_from_bundle(tokenizer_path):
+    """Load tokenizer trực tiếp từ tokenizer.json để tránh custom tokenizer_class."""
+    tokenizer_dir = tokenizer_path if os.path.isdir(tokenizer_path) else os.path.dirname(tokenizer_path)
+    tokenizer_file = os.path.join(tokenizer_dir, "tokenizer.json")
+    config_file = os.path.join(tokenizer_dir, "tokenizer_config.json")
+
+    if not os.path.exists(tokenizer_file):
+        raise FileNotFoundError(f"Không tìm thấy tokenizer.json trong {tokenizer_dir}")
+
+    config = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, encoding="utf-8") as handle:
+                config = json.load(handle)
+        except Exception:
+            config = {}
+
+    special_tokens = {
+        "unk_token": config.get("unk_token", "[UNK]"),
+        "pad_token": config.get("pad_token", "[PAD]"),
+        "cls_token": config.get("cls_token", "[CLS]"),
+        "sep_token": config.get("sep_token", "[SEP]"),
+        "mask_token": config.get("mask_token", "[MASK]"),
+    }
+    model_max_length = config.get("model_max_length", config.get("max_length", 512))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, **special_tokens)
+    tokenizer.model_max_length = model_max_length
+    tokenizer.truncation_side = config.get("truncation_side", "right")
+    return tokenizer
+
+
 def _get_secret(key, default=""):
     """Doc tu st.secrets, fallback ve bien moi truong."""
     try:
@@ -244,16 +283,23 @@ def _normalize_kaggle_model_handle(resource):
 def download_model_from_kaggle():
     """Tai models_student_6l tu Kaggle bang kagglehub.
 
-    - Dung KAGGLE_MODEL + kagglehub.model_download.
+    - Uu tien KAGGLE_MODEL_FP16 + kagglehub.model_download.
+    - Neu fp16 khong dung, thu KAGGLE_MODEL_FULL.
     - Model private can them KAGGLE_USERNAME + KAGGLE_KEY trong secrets/env.
     Tra ve duong dan thu muc chua model, hoac None neu tai that bai.
     """
-    resource = _normalize_kaggle_model_handle(
-        _get_secret("KAGGLE_MODEL", _DEFAULT_KAGGLE_MODEL)
-    )
-    if not resource or resource.startswith("<"):
+    model_candidates = [
+        _normalize_kaggle_model_handle(
+            _get_secret("KAGGLE_MODEL_FP16", _DEFAULT_KAGGLE_MODEL_FP16)
+        ),
+        _normalize_kaggle_model_handle(
+            _get_secret("KAGGLE_MODEL_FULL", _DEFAULT_KAGGLE_MODEL_FULL)
+        ),
+    ]
+    model_candidates = [resource for resource in model_candidates if resource and not resource.startswith("<")]
+    if not model_candidates:
         st.error(
-            "❌ Chưa cấu hình Kaggle model. Khai báo `KAGGLE_MODEL` "
+            "❌ Chưa cấu hình Kaggle model. Khai báo `KAGGLE_MODEL_FP16` "
             "(dạng `username/model-slug/pyTorch/default`) trong secrets hoặc biến môi trường."
         )
         return None
@@ -270,11 +316,19 @@ def download_model_from_kaggle():
         st.error("❌ Thiếu thư viện `kagglehub`. Cài bằng: `pip install kagglehub`")
         return None
 
-    try:
-        with st.spinner(f"⬇️ Đang tải mô hình từ Kaggle (`{resource}`)..."):
-            root = kagglehub.model_download(resource)
-    except Exception as e:
-        st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{resource}`): {e}")
+    root = None
+    last_error = None
+    for resource in model_candidates:
+        try:
+            with st.spinner(f"⬇️ Đang tải mô hình từ Kaggle (`{resource}`)..."):
+                root = kagglehub.model_download(resource)
+            break
+        except Exception as e:
+            last_error = e
+            root = None
+
+    if root is None:
+        st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{model_candidates[0]}`): {last_error}")
         return None
 
     bundle = _find_model_bundle(root)
@@ -282,7 +336,7 @@ def download_model_from_kaggle():
         return bundle
 
     st.error(
-        f"❌ Model Kaggle `{resource}` không chứa đủ artefact hợp lệ "
+        f"❌ Model Kaggle `{model_candidates[0]}` không chứa đủ artefact hợp lệ "
         "(cần checkpoint như `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`)."
     )
     return None
@@ -361,13 +415,13 @@ def load_models():
             "❌ Không tìm thấy mô hình `models_student_6l` "
             "(cần checkpoint như `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`).\n\n"
             "Đặt thư mục cạnh app, khai báo `MODEL_DIR`, hoặc cấu hình "
-            "`KAGGLE_MODEL` trong secrets/biến môi trường để tải từ Kaggle."
+            "`KAGGLE_MODEL_FP16` trong secrets/biến môi trường để tải từ Kaggle."
         )
         return None
 
     try:
         meta = json.load(open(model_bundle["meta_path"], encoding="utf-8"))
-        tokenizer = AutoTokenizer.from_pretrained(model_bundle["tokenizer_path"])
+        tokenizer = _load_tokenizer_from_bundle(model_bundle["tokenizer_path"])
         model = HanNomClassifier(meta["base_model"], meta["emb_rows"],
                                  len(meta["classes"]), meta.get("num_layers"))
         ckpt = model_bundle["checkpoint_path"]
