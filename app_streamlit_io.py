@@ -163,6 +163,21 @@ def _is_tokenizer_dir(path):
     return bool({"tokenizer.json", "tokenizer_config.json", "vocab.txt"} & entries)
 
 
+def _find_checkpoint_under_root(root):
+    """Tim checkpoint PyTorch dau tien trong root hoac cac thu muc con."""
+    if not root or not os.path.exists(root):
+        return None
+    if os.path.isfile(root) and _is_checkpoint_file(root):
+        return root
+
+    for cur, _dirs, files in os.walk(root):
+        for file_name in files:
+            full_path = os.path.join(cur, file_name)
+            if _is_checkpoint_file(full_path):
+                return full_path
+    return None
+
+
 def _find_model_bundle(root):
     """Tim bo artefact model trong root Kaggle hoac thu muc local.
 
@@ -215,6 +230,36 @@ def _find_model_bundle(root):
                 "meta_path": candidate_meta,
                 "tokenizer_path": candidate_tokenizer,
                 "checkpoint_path": candidate_checkpoint,
+            }
+
+    return None
+
+
+def _find_local_metadata_bundle():
+    """Lay bundle local co meta.json + tokenizer de ghep voi checkpoint tu Kaggle."""
+    for d in [_get_secret("MODEL_DIR")] + _MODEL_DIR_CANDIDATES:
+        if not d or not os.path.exists(d):
+            continue
+
+        meta_path = None
+        tokenizer_path = None
+
+        if os.path.isfile(d):
+            d = os.path.dirname(d)
+
+        if os.path.exists(os.path.join(d, "meta.json")):
+            meta_path = os.path.join(d, "meta.json")
+
+        if os.path.isdir(os.path.join(d, "tokenizer")):
+            tokenizer_path = os.path.join(d, "tokenizer")
+        elif _is_tokenizer_dir(d):
+            tokenizer_path = d
+
+        if meta_path and tokenizer_path:
+            return {
+                "bundle_root": d,
+                "meta_path": meta_path,
+                "tokenizer_path": tokenizer_path,
             }
 
     return None
@@ -330,6 +375,23 @@ def download_model_from_kaggle():
     if root is None:
         st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{model_candidates[0]}`): {last_error}")
         return None
+
+    checkpoint_path = _find_checkpoint_under_root(root)
+    if checkpoint_path:
+        base_bundle = _find_local_metadata_bundle()
+        if not base_bundle:
+            st.error(
+                f"❌ Kaggle chỉ trả về checkpoint `{os.path.basename(checkpoint_path)}` nhưng không tìm thấy "
+                "bundle local chứa `meta.json` và `tokenizer/` để ghép lại."
+            )
+            return None
+        return {
+            "bundle_root": base_bundle["bundle_root"],
+            "meta_path": base_bundle["meta_path"],
+            "tokenizer_path": base_bundle["tokenizer_path"],
+            "checkpoint_path": checkpoint_path,
+            "source": "kaggle-checkpoint+local-meta",
+        }
 
     bundle = _find_model_bundle(root)
     if bundle:
