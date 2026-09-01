@@ -134,6 +134,84 @@ def _is_model_dir(d):
     )
 
 
+def _is_checkpoint_file(path):
+    """Nhan dien cac file checkpoint PyTorch thong dung."""
+    if not path or not os.path.isfile(path):
+        return False
+    name = os.path.basename(path)
+    return name in {
+        "model_fp16.pt",
+        "model.pt",
+        "pytorch_model.bin",
+        "model.bin",
+    }
+
+
+def _is_tokenizer_dir(path):
+    """Nhan dien thu muc tokenizer Hugging Face."""
+    if not path or not os.path.isdir(path):
+        return False
+    entries = set(os.listdir(path))
+    return bool({"tokenizer.json", "tokenizer_config.json", "vocab.txt"} & entries)
+
+
+def _find_model_bundle(root):
+    """Tim bo artefact model trong root Kaggle hoac thu muc local.
+
+    Tra ve dict co:
+    - meta_path
+    - tokenizer_path
+    - checkpoint_path
+    - bundle_root
+    """
+    if not root or not os.path.exists(root):
+        return None
+
+    candidate_meta = None
+    candidate_tokenizer = None
+    candidate_checkpoint = None
+
+    if os.path.isfile(root):
+        if _is_checkpoint_file(root):
+            candidate_checkpoint = root
+        root = os.path.dirname(root)
+
+    if _is_model_dir(root):
+        candidate_meta = os.path.join(root, "meta.json")
+        candidate_tokenizer = os.path.join(root, "tokenizer") if os.path.isdir(os.path.join(root, "tokenizer")) else root
+        candidate_checkpoint = os.path.join(root, "model_fp16.pt") if os.path.exists(os.path.join(root, "model_fp16.pt")) else os.path.join(root, "model.pt")
+        return {
+            "bundle_root": root,
+            "meta_path": candidate_meta,
+            "tokenizer_path": candidate_tokenizer,
+            "checkpoint_path": candidate_checkpoint,
+        }
+
+    for cur, _dirs, files in os.walk(root):
+        if candidate_meta is None and "meta.json" in files:
+            candidate_meta = os.path.join(cur, "meta.json")
+
+        if candidate_tokenizer is None and _is_tokenizer_dir(cur):
+            candidate_tokenizer = cur
+
+        if candidate_checkpoint is None:
+            for file_name in files:
+                full_path = os.path.join(cur, file_name)
+                if _is_checkpoint_file(full_path):
+                    candidate_checkpoint = full_path
+                    break
+
+        if candidate_meta and candidate_tokenizer and candidate_checkpoint:
+            return {
+                "bundle_root": root,
+                "meta_path": candidate_meta,
+                "tokenizer_path": candidate_tokenizer,
+                "checkpoint_path": candidate_checkpoint,
+            }
+
+    return None
+
+
 def _get_secret(key, default=""):
     """Doc tu st.secrets, fallback ve bien moi truong."""
     try:
@@ -199,16 +277,13 @@ def download_model_from_kaggle():
         st.error(f"❌ Lỗi khi tải mô hình từ Kaggle (`{resource}`): {e}")
         return None
 
-    # Tim thu muc model: goc model hoac thu muc con (vd. models_student_6l/)
-    if _is_model_dir(root):
-        return root
-    for cur, _dirs, _files in os.walk(root):
-        if _is_model_dir(cur):
-            return cur
+    bundle = _find_model_bundle(root)
+    if bundle:
+        return bundle
 
     st.error(
-        f"❌ Model Kaggle `{resource}` không chứa model hợp lệ "
-        "(cần `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`)."
+        f"❌ Model Kaggle `{resource}` không chứa đủ artefact hợp lệ "
+        "(cần checkpoint như `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`)."
     )
     return None
 
@@ -216,10 +291,11 @@ def download_model_from_kaggle():
 def resolve_model_dir():
     """Tim thu muc mo hinh student local; khong co thi tai tu Kaggle."""
     for d in [_get_secret("MODEL_DIR")] + _MODEL_DIR_CANDIDATES:
-        if _is_model_dir(d):
-            return os.path.abspath(d)
+        bundle = _find_model_bundle(d)
+        if bundle:
+            return bundle
     kaggle_dir = download_model_from_kaggle()
-    return os.path.abspath(kaggle_dir) if kaggle_dir else None
+    return kaggle_dir if kaggle_dir else None
 
 
 # ----------------------------------------------- Han-Nom character filtering
@@ -279,33 +355,33 @@ def load_models():
     else:
         device = torch.device("cpu")
 
-    model_dir = resolve_model_dir()
-    if model_dir is None:
+    model_bundle = resolve_model_dir()
+    if model_bundle is None:
         st.error(
             "❌ Không tìm thấy mô hình `models_student_6l` "
-            "(cần `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`).\n\n"
+            "(cần checkpoint như `model_fp16.pt`/`model.pt`, `tokenizer/`, `meta.json`).\n\n"
             "Đặt thư mục cạnh app, khai báo `MODEL_DIR`, hoặc cấu hình "
-            "`KAGGLE_DATASET` trong secrets/biến môi trường để tải từ Kaggle."
+            "`KAGGLE_MODEL` trong secrets/biến môi trường để tải từ Kaggle."
         )
         return None
 
     try:
-        meta = json.load(open(os.path.join(model_dir, "meta.json"), encoding="utf-8"))
-        tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+        meta = json.load(open(model_bundle["meta_path"], encoding="utf-8"))
+        tokenizer = AutoTokenizer.from_pretrained(model_bundle["tokenizer_path"])
         model = HanNomClassifier(meta["base_model"], meta["emb_rows"],
                                  len(meta["classes"]), meta.get("num_layers"))
-        fp16_path = os.path.join(model_dir, "model_fp16.pt")
-        ckpt = fp16_path if os.path.exists(fp16_path) else os.path.join(model_dir, "model.pt")
+        ckpt = model_bundle["checkpoint_path"]
         state = torch.load(ckpt, map_location="cpu")
         # checkpoint fp16 -> ep ve fp32 de chay CPU (CPU khong ho tro fp16 tot)
         state = {k: (v.float() if v.is_floating_point() else v) for k, v in state.items()}
         model.load_state_dict(state)
         model.to(device).eval()
-        meta["_model_dir"] = model_dir
+        meta["_model_dir"] = model_bundle["bundle_root"]
+        meta["_model_bundle"] = model_bundle
         meta["_checkpoint"] = os.path.basename(ckpt)
         return tokenizer, model, meta, device
     except Exception as e:
-        st.error(f"❌ Lỗi khi tải mô hình từ {model_dir}: {e}")
+        st.error(f"❌ Lỗi khi tải mô hình từ {model_bundle.get('bundle_root', '')}: {e}")
         return None
 
 
