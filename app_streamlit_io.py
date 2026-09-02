@@ -31,8 +31,6 @@ from PIL import Image
 from transformers import AutoModel, PreTrainedTokenizerFast
 
 torch.set_num_threads(4)
-if hasattr(torch, "set_num_interop_threads"):
-    torch.set_num_interop_threads(1)
 
 # Set page config
 st.set_page_config(
